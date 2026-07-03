@@ -31,6 +31,7 @@ from gsplat.cuda._lidar import (
     RowOffsetStructuredSpinningLidarModelParameters,
     RowOffsetStructuredSpinningLidarModelParametersExt as RowOffsetStructuredSpinningLidarModelParametersExtBase,
     FOV as FOVBase,
+    compute_rays_structured_lidar_components,
 )
 
 ExternalDistortionModelMeta = Literal["bivariate-windshield"]
@@ -283,6 +284,57 @@ class RowOffsetStructuredSpinningLidarModelParametersExt(
             tiles_to_elements_map=self.tiling.tiles_to_elements_map.contiguous(),
             tiles_pack_info=self.tiling.tiles_pack_info.contiguous(),
         )
+
+
+class RaysStructuredLidarModelParametersExt(
+    RowOffsetStructuredSpinningLidarModelParametersExt
+):
+    """Lidar model defined directly by measured per-element rays.
+
+    For lidars whose scan pattern is not a separable spinning grid (e.g.
+    galvo + prism sensors): tiling bins every element by its REAL measured
+    angle and the angles map encodes quantized REAL emission times; a
+    separable spinning model is fitted internally as angular scaffolding only.
+    Ray GEOMETRY must be provided to ``rasterization`` via the ``rays`` tensor.
+
+    Timestamps semantics: they are NOT needed for the rays themselves (motion
+    compensation is baked into ray origins/directions by the caller); they
+    drive the rolling-shutter pose interpolation used to bin GAUSSIANS into
+    tiles. ``timestamps_rel=None`` means global-shutter binning (fine for a
+    static sensor); with timestamps, pass ``viewmats`` / ``viewmats_rs`` poses
+    taken at relative times 0 and 1 respectively.
+
+    See ``compute_rays_structured_lidar_components`` for the argument
+    semantics and input-grid requirements.
+    """
+
+    def __init__(
+        self,
+        directions: Tensor,
+        timestamps_rel: Optional[Tensor] = None,
+        valid_mask: Optional[Tensor] = None,
+        *,
+        spinning_direction: Optional[SpinningDirection] = None,
+        n_bins_elevation: int = 16,
+        max_pts_per_tile: int = 256,
+        resolution_elevation: int = 1600,
+        densification_factor_azimuth: int = 8,
+        resolution_factor: int = 4,
+        device: str = "cuda",
+    ) -> None:
+        base, angles_map, tiling = compute_rays_structured_lidar_components(
+            directions,
+            timestamps_rel=timestamps_rel,
+            valid_mask=valid_mask,
+            spinning_direction=spinning_direction,
+            n_bins_elevation=n_bins_elevation,
+            max_pts_per_tile=max_pts_per_tile,
+            resolution_elevation=resolution_elevation,
+            densification_factor_azimuth=densification_factor_azimuth,
+            resolution_factor=resolution_factor,
+            device=device,
+        )
+        super().__init__(base, angles_map, tiling)
 
 
 def world_to_cam(

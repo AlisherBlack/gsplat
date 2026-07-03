@@ -1035,3 +1035,222 @@ def compute_tiling(
     params.cdf_elevation = params.cdf_elevation.int()
 
     return LidarTiling(**vars(params))
+
+
+# --------------------- Rays-structured lidar model ---------------------------
+
+
+def _make_strictly_monotonic(
+    v: np.ndarray, *, increasing: bool, min_step: float = 1e-6
+) -> np.ndarray:
+    """Nudge ties/tiny inversions so the sequence is strictly monotonic."""
+    s = 1.0 if increasing else -1.0
+    x = (s * np.asarray(v, dtype=np.float64)).copy()
+    for i in range(1, len(x)):
+        if x[i] <= x[i - 1]:
+            x[i] = x[i - 1] + min_step
+    return s * x
+
+
+def _masked_mean(values: np.ndarray, mask: np.ndarray, axis: int) -> np.ndarray:
+    """Mean of ``values`` over ``mask`` along ``axis``; NaN where mask is empty."""
+    total = np.where(mask, values, 0.0).sum(axis=axis)
+    count = mask.sum(axis=axis)
+    out = np.full(total.shape, np.nan)
+    nonzero = count > 0
+    out[nonzero] = total[nonzero] / count[nonzero]
+    return out
+
+
+def _fill_nan_by_interp(v: np.ndarray) -> np.ndarray:
+    """Fill NaN entries by linear interpolation over the index axis."""
+    v = np.asarray(v, dtype=np.float64).copy()
+    nan = np.isnan(v)
+    if not nan.any():
+        return v
+    assert not nan.all(), "cannot interpolate an all-NaN sequence"
+    idx = np.arange(len(v))
+    v[nan] = np.interp(idx[nan], idx[~nan], v[~nan])
+    return v
+
+
+def compute_rays_structured_lidar_components(
+    directions: Tensor,
+    timestamps_rel: Optional[Tensor] = None,
+    valid_mask: Optional[Tensor] = None,
+    *,
+    spinning_direction: Optional[SpinningDirection] = None,
+    n_bins_elevation: int = 16,
+    max_pts_per_tile: int = 256,
+    resolution_elevation: int = 1600,
+    densification_factor_azimuth: int = 8,
+    resolution_factor: int = 4,
+    device: str = "cuda",
+) -> tuple[RowOffsetStructuredSpinningLidarModelParameters, Tensor, LidarTiling]:
+    """Build lidar model components for a lidar defined by measured rays.
+
+    Assembly behind ``RaysStructuredLidarModelParametersExt`` (defined in
+    ``_wrapper`` so it inherits ``to_cpp``): for lidars whose scan pattern is
+    not a separable spinning grid (e.g. galvo + prism sensors), the model is
+    specified by the measured unit ray direction of every panorama element,
+    plus optionally the relative emission time of every element. A separable
+    spinning model is fitted as angular SCAFFOLDING only (it defines the FOV /
+    map coordinate space); all acceleration structures are data-driven:
+
+    - tiling bins every element by its REAL angle (``compute_tiling`` with
+      ``element_angles``);
+    - the angles map encodes quantized REAL emission times
+      (``compute_angles_to_values_map``), so ``shutter_relative_frame_time``
+      returns correct rolling-shutter timing for ANY scan order.
+
+    Requirements on the input grid:
+    - rows (rings) sorted by descending mean elevation;
+    - columns ordered by azimuth (monotonic on average; the spin direction is
+      inferred from the sign, or forced via ``spinning_direction``);
+    - fully-invalid rows/columns are allowed — their scaffolding angles are
+      interpolated from neighbors;
+    - invalid elements (``valid_mask``) get the nominal angle of their cell so
+      every element stays in some tile (the rasterizer output buffers are not
+      zero-initialized — an element assigned to no tile would keep garbage).
+
+    Args:
+        directions: (n_rows, n_columns, 3) unit ray directions in the sensor
+            frame; rows sorted by descending mean elevation.
+        timestamps_rel: optional (n_rows, n_columns) relative emission times
+            in [0, 1] (0 = scan start / ``viewmats`` pose, 1 = scan end /
+            ``viewmats_rs`` pose). Values are clipped. None ⇒ the map holds
+            column indices (global-shutter binning semantics).
+        valid_mask: optional (n_rows, n_columns) bool; False elements have no
+            measurement (padding) and get nominal cell angles.
+        spinning_direction: force the scaffolding spin direction; None infers
+            it from the sign of the median column-azimuth step.
+        n_bins_elevation / max_pts_per_tile / resolution_elevation /
+            densification_factor_azimuth: see ``compute_tiling``.
+        resolution_factor: angles-map density, see
+            ``compute_angles_to_values_map``.
+
+    Returns:
+        ``(base_params, angles_map, tiling)`` — the constructor arguments of
+        ``RowOffsetStructuredSpinningLidarModelParametersExt``.
+    """
+    dirs = torch.as_tensor(directions).to(torch.float64).cpu().numpy()
+    assert dirs.ndim == 3 and dirs.shape[-1] == 3, dirs.shape
+    n_rows, n_columns = dirs.shape[:2]
+    assert n_rows >= 2 and n_columns >= 2, (n_rows, n_columns)
+
+    if valid_mask is None:
+        valid = np.ones((n_rows, n_columns), dtype=bool)
+    else:
+        valid = torch.as_tensor(valid_mask).cpu().numpy().astype(bool)
+        assert valid.shape == (n_rows, n_columns), valid.shape
+    assert valid.any(), "valid_mask must keep at least one element"
+
+    norms = np.linalg.norm(dirs, axis=-1)
+    assert np.all(
+        norms[valid] > 1e-6
+    ), "valid directions must be non-degenerate"
+    dirs = dirs / norms.clip(1e-8)[..., None]
+
+    elevation = np.arcsin(np.clip(dirs[..., 2], -1.0, 1.0))
+    azimuth = np.arctan2(dirs[..., 1], dirs[..., 0])
+
+    # Recenter azimuth around the circular mean of the valid elements so
+    # the panorama is continuous even when it crosses the ±pi seam (the
+    # center constant cancels out in relative angles downstream).
+    az_valid = azimuth[valid]
+    center = float(
+        np.arctan2(np.mean(np.sin(az_valid)), np.mean(np.cos(az_valid)))
+    )
+    azimuth = center + (azimuth - center + np.pi) % (2.0 * np.pi) - np.pi
+
+    # ----- Fit the separable scaffolding (FOV / coordinate space only). ------
+    row_el = _fill_nan_by_interp(_masked_mean(elevation, valid, axis=1))
+    col_az = _fill_nan_by_interp(_masked_mean(azimuth, valid, axis=0))
+
+    assert np.all(np.diff(row_el) < 1e-6), (
+        "rows must be sorted by descending mean elevation "
+        "(sort the panorama rings before constructing the model)"
+    )
+    row_el = _make_strictly_monotonic(row_el, increasing=False)
+
+    if spinning_direction is None:
+        spinning_direction = (
+            SpinningDirection.CLOCKWISE
+            if float(np.median(np.diff(col_az))) < 0
+            else SpinningDirection.COUNTER_CLOCKWISE
+        )
+    col_increasing = spinning_direction == SpinningDirection.COUNTER_CLOCKWISE
+    expected_sign = 1.0 if col_increasing else -1.0
+    frac_against = float(np.mean(np.sign(np.diff(col_az)) != expected_sign))
+    assert frac_against <= 0.1, (
+        f"column azimuths are not ordered in the {spinning_direction.name} "
+        f"direction ({frac_against:.0%} of steps have the wrong sign) — "
+        "columns must be ordered by azimuth"
+    )
+    col_az = _make_strictly_monotonic(col_az, increasing=col_increasing)
+
+    row_off = _fill_nan_by_interp(
+        _masked_mean(azimuth - col_az[None, :], valid, axis=1)
+    )
+
+    base = RowOffsetStructuredSpinningLidarModelParameters(
+        row_elevations_rad=torch.tensor(
+            row_el, dtype=torch.float32, device=device
+        ),
+        column_azimuths_rad=torch.tensor(
+            col_az, dtype=torch.float32, device=device
+        ),
+        row_azimuth_offsets_rad=torch.tensor(
+            row_off, dtype=torch.float32, device=device
+        ),
+        spinning_direction=spinning_direction,
+        # Unused on the rays path: emission times come from the angles
+        # map, ray geometry from the rays tensor. Required by the base
+        # dataclass only.
+        spinning_frequency_hz=10.0,
+    )
+
+    # ----- Data-driven tiling: bin elements by their REAL angles. ------------
+    nominal_az = col_az[None, :] + row_off[:, None]
+    nominal_el = np.broadcast_to(row_el[:, None], (n_rows, n_columns))
+    element_angles = torch.tensor(
+        np.stack(
+            [
+                np.where(valid, azimuth, nominal_az),
+                np.where(valid, elevation, nominal_el),
+            ],
+            axis=-1,
+        ).reshape(-1, 2),
+        dtype=torch.float32,
+        device=device,
+    )
+    tiling = compute_tiling(
+        base,
+        n_bins_elevation=n_bins_elevation,
+        max_pts_per_tile=max_pts_per_tile,
+        resolution_elevation=resolution_elevation,
+        densification_factor_azimuth=densification_factor_azimuth,
+        element_angles=element_angles,
+    )
+
+    # ----- Angles map: real emission times, or column indices. ---------------
+    if timestamps_rel is not None:
+        t_rel = torch.as_tensor(timestamps_rel).to(torch.float64).cpu().numpy()
+        assert t_rel.shape == (n_rows, n_columns), t_rel.shape
+        t_rel = np.clip(t_rel, 0.0, 1.0)
+        time_values = torch.tensor(
+            np.rint(t_rel[valid] * (n_columns - 1)).astype(np.int64),
+            device=device,
+        )
+        element_rays = torch.tensor(
+            dirs[valid], dtype=torch.float32, device=device
+        )
+        angles_map = compute_angles_to_values_map(
+            base, element_rays, time_values, resolution_factor=resolution_factor
+        )
+    else:
+        angles_map = compute_angles_to_columns_map(
+            base, resolution_factor=resolution_factor
+        )
+
+    return base, angles_map, tiling
