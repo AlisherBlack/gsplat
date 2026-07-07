@@ -48,7 +48,6 @@ from .cuda._wrapper import (
     has_reloc,
     RowOffsetStructuredSpinningLidarModelParameters,
     RowOffsetStructuredSpinningLidarModelParametersExt,
-    RaysStructuredLidarModelParametersExt,
 )
 from .exporter import export_splats
 from .optimizers import SelectiveAdam
@@ -113,7 +112,6 @@ all = [
     "has_reloc",
     "RowOffsetStructuredSpinningLidarModelParameters",
     "RowOffsetStructuredSpinningLidarModelParametersExt",
-    "RaysStructuredLidarModelParametersExt",
     "compute_lidar_angles_to_columns_map",
     "compute_lidar_tiling",
     "LidarTiling",
