@@ -527,18 +527,16 @@ def clamp_element_angles_to_fov(
     parameters: RowOffsetStructuredSpinningLidarModelParameters,
     element_angles: Tensor,
 ) -> Tensor:
-    """Sanitize measured per-element sensor angles so they can replace the
-    idealized ``elements_to_sensor_angles`` grid in the tiling code.
-
-    element_angles: [..., 2] with [..., 0]=azimuth, [..., 1]=elevation
-    (radians, sensor frame). Returns absolute angles of the same shape.
-
-    Real angles of a non-separable scan pattern (e.g. galvo + prism) can stick
-    out slightly past the FOV of the fitted separable model. Downstream tiling
-    code requires angles inside the FOV (bounds asserts in
-    ``compute_histogram_equalization``; the ``int() % n_bins`` quantization in
-    ``angles_to_dense_ray_mask_cdf`` wraps out-of-range angles around), so we
-    clamp in relative-angle space and convert back to absolute angles.
+    """
+    (1) The reason is that the FOV is computed from averaged angles, 
+        so the real edge angles inevitably stick out beyond it; 
+    (2) without clamping, this leads either to assertion failures 
+        or to a silent wrap into the opposite tile, producing an empty pixel / hole at the edge; 
+    (3) clamping to the boundary puts the pixel into the edge tile, which is geometrically correct; 
+    (4) this only affects addressing — the `rays` tensor is not touched, and the values are 
+        computed using the exact rays;
+    (5) the margin is a safeguard against the floating-point round-trip: clamping exactly to 
+        the boundary could make the angle “pop out” again, while the margin is geometrically negligible.
     """
     element_angles = element_angles.to(
         device=parameters.device, dtype=parameters.dtype
@@ -631,16 +629,7 @@ def compute_angles_to_values_map(
     """Generalization of ``compute_angles_to_columns_map``: computes a 2D map of
     shape resolution_factor * (n_rows, n_columns) spanning the FOV, where each
     grid cell stores ``values[i]`` of the nearest (L^2 over unit rays) element
-    ray ``i``.
-
-    Since the only consumer of the map is ``shutter_relative_frame_time``
-    (which divides the stored value by ``n_columns - 1``), storing quantized
-    emission times ``round(t_rel * (n_columns - 1))`` instead of column indices
-    yields correct rolling-shutter timing for lidars whose scan pattern is not
-    column-sequential (e.g. galvo + prism).
-
-    element_rays: (N, 3) unit rays in the sensor frame.
-    values: (N,) integer values to store in the map.
+    ray ``i``
     """
     assert (
         element_rays.ndim == 2 and element_rays.shape[-1] == 3
@@ -896,8 +885,8 @@ def compute_histogram_equalization(
         elements = parameters.create_elements()
         angles = parameters.elements_to_sensor_angles(elements)
     else:
-        # Measured per-element angles (non-separable scan patterns) instead of
-        # the idealized separable grid; see clamp_element_angles_to_fov.
+        # Measured per-element angles (non-separable scan patterns); 
+        # see clamp_element_angles_to_fov.
         angles = clamp_element_angles_to_fov(
             parameters, element_angles.reshape(-1, 2)
         )
@@ -1001,13 +990,8 @@ def compute_tiling(
     densification_factor_azimuth: int = 8,
     element_angles: Optional[Tensor] = None,
 ) -> LidarTiling:
-    """Computes the lidar tiling acceleration structure.
-
-    element_angles: optional measured per-element (azimuth, elevation) angles,
-    shape (n_rows * n_columns, 2) in the row-major ``create_elements`` order.
-    When given, elements are binned into tiles by their REAL angles instead of
-    the idealized separable grid — required for non-separable scan patterns
-    (e.g. galvo + prism lidars) where elevation varies within a row.
+    """
+    element_angles: (n_rows * n_columns, 2) for not spinning tiling.
     """
     params = SimpleNamespace()
     params.n_bins_elevation = n_bins_elevation
